@@ -589,8 +589,7 @@ add_watch (SeafWTMonitorPriv *priv, const char *repo_id, const char *worktree)
 
 static int handle_add_repo (SeafWTMonitorPriv *priv,
                             const char *repo_id,
-                            const char *worktree,
-                            long *handle) 
+                            const char *worktree)
 {
     int inotify_fd;
 
@@ -601,7 +600,6 @@ static int handle_add_repo (SeafWTMonitorPriv *priv,
 
     FD_SET (inotify_fd, &priv->read_fds);
     priv->maxfd = MAX (inotify_fd, priv->maxfd);
-    *handle = (long)inotify_fd;
     return 0;
 }
 
@@ -670,7 +668,7 @@ handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd)
             return;
         }
 
-        if (handle_add_repo(priv, cmd->repo_id, cmd->worktree, &inotify_fd) < 0) {
+        if (handle_add_repo(priv, cmd->repo_id, cmd->worktree) < 0) {
             seaf_warning ("[wt mon] failed to watch worktree of repo %s.\n",
                           cmd->repo_id);
             reply_watch_command (monitor, -1);

@@ -14,23 +14,12 @@
 #define DEBUG_FLAG SEAFILE_DEBUG_WATCH
 #include "log.h"
 
-typedef enum CommandType {
-    CMD_ADD_WATCH,
-    CMD_DELETE_WATCH,
-    CMD_REFRESH_WATCH,
-    N_CMD_TYPES,
-} CommandType;
-
-typedef struct WatchCommand {
-    CommandType type;
-    char repo_id[37];
-} WatchCommand;
-
 #define DIR_WATCH_MASK                                            \
     FILE_NOTIFY_CHANGE_FILE_NAME |  FILE_NOTIFY_CHANGE_LAST_WRITE \
     | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE 
 
-#define DIR_WATCH_BUFSIZE (sizeof(FILE_NOTIFY_INFORMATION) + SEAF_PATH_MAX * 2)
+/* Use large buffer to prevent events overflow. */
+#define DIR_WATCH_BUFSIZE 1 << 20 /* 1MB */
 
 /* Hold the OVERLAPPED struct for asynchronous ReadDirectoryChangesW(), and
    the buf to receive dir change info. */
@@ -40,20 +29,95 @@ typedef struct DirWatchAux {
     gboolean unused;
 } DirWatchAux;
 
+typedef struct RenameInfo {
+    char *old_path;
+    gboolean processing;        /* Are we processing a rename event? */
+} RenameInfo;
+
+typedef struct EventInfo {
+    DWORD action;
+    DWORD name_len;
+    char name[SEAF_PATH_MAX];
+} EventInfo;
+
+typedef struct RepoWatchInfo {
+    WTStatus *status;
+    RenameInfo *rename_info;
+    EventInfo last_event;
+    char *worktree;
+} RepoWatchInfo;
+
 struct SeafWTMonitorPriv {
+    pthread_mutex_t hash_lock;
     GHashTable *handle_hash;    /* repo_id -> dir handle */
-    GHashTable *status_hash;    /* handle -> status  */
+    GHashTable *info_hash;      /* handle -> RepoWatchInfo  */
     GHashTable *buf_hash;       /* handle -> aux buf */
 
-    int cmd_pipe[2];
-    int res_pipe[2];
-
     HANDLE iocp_handle;
-    WatchCommand cmd;           /* latest received command */
-    
 };
 
+static void *wt_monitor_job_win32 (void *vmonitor);
+
 static void handle_watch_command (SeafWTMonitorPriv *priv, WatchCommand *cmd);
+
+static int
+add_events_recursive (RepoWatchInfo *info,
+                      const char *worktree, const char *path);
+
+/* RenameInfo */
+
+static RenameInfo *create_rename_info ()
+{
+    RenameInfo *info = g_new0 (RenameInfo, 1);
+
+    return info;
+}
+
+static void free_rename_info (RenameInfo *info)
+{
+    g_free (info->old_path);
+    g_free (info);
+}
+
+inline static void
+set_rename_processing_state (RenameInfo *info, const char *path)
+{
+    info->old_path = g_strdup(path);
+    info->processing = TRUE;
+}
+
+inline static void
+unset_rename_processing_state (RenameInfo *info)
+{
+    g_free (info->old_path);
+    info->old_path = NULL;
+    info->processing = FALSE;
+}
+
+/* RepoWatchInfo */
+
+static RepoWatchInfo *
+create_repo_watch_info (const char *repo_id, const char *worktree)
+{
+    WTStatus *status = create_wt_status (repo_id);
+    RenameInfo *rename_info = create_rename_info ();
+
+    RepoWatchInfo *info = g_new0 (RepoWatchInfo, 1);
+    info->status = status;
+    info->rename_info = rename_info;
+    info->worktree = g_strdup(worktree);
+
+    return info;
+}
+
+static void
+free_repo_watch_info (RepoWatchInfo *info)
+{
+    wt_status_unref (info->status);
+    free_rename_info (info->rename_info);
+    g_free (info->worktree);
+    g_free (info);
+}
 
 static inline void
 init_overlapped(OVERLAPPED *ol)
@@ -68,6 +132,36 @@ reset_overlapped(OVERLAPPED *ol)
     ol->Offset = ol->OffsetHigh = 0;
 }
 
+static void
+add_event_to_queue (WTStatus *status,
+                    int type, const char *path, const char *new_path)
+{
+    WTEvent *event = wt_event_new (type, path, new_path);
+
+    char *name;
+    switch (type) {
+    case WT_EVENT_CREATE_OR_UPDATE:
+        name = "create/update";
+        break;
+    case WT_EVENT_DELETE:
+        name = "delete";
+        break;
+    case WT_EVENT_RENAME:
+        name = "rename";
+        break;
+    case WT_EVENT_OVERFLOW:
+        name = "overflow";
+        break;
+    default:
+        name = "unknown";
+    }
+
+    seaf_debug ("Adding event: %s, %s %s\n", name, path, new_path?new_path:"");
+
+    pthread_mutex_lock (&status->q_lock);
+    g_queue_push_tail (status->event_q, event);
+    pthread_mutex_unlock (&status->q_lock);
+}
 
 /* Every time after a read event is processed, we should call
  * ReadDirectoryChangesW() on the dir handle asynchronously for the IOCP to
@@ -93,9 +187,9 @@ start_watch_dir_change(SeafWTMonitorPriv *priv, HANDLE dir_handle)
 
     /* The ending W of this function indicates that the info recevied about
        the change would be in Unicode(specifically, the name of the file that
-       is changed would be encoded in wide char), but we don't care it right
-       now. Maybe in the future.
+       is changed would be encoded in wide char).
     */
+retry:
     BOOL ret = ReadDirectoryChangesW
         (dir_handle,            /* dir handle */
          &aux->buf,              /* buf to hold change info */
@@ -107,12 +201,20 @@ start_watch_dir_change(SeafWTMonitorPriv *priv, HANDLE dir_handle)
          NULL);                 /* completion routine */
 
     if (!ret) {
+        DWORD code = GetLastError();
+        seaf_warning("Failed to ReadDirectoryChangesW, "
+                     "error code %lu", code);
+
         if (first_alloc)
             /* if failed at the first watch, free the aux buffer */
             g_free(aux);
-
-        seaf_warning("Failed to ReadDirectoryChangesW, "
-                     "error code %lu", GetLastError());
+        else if (code == ERROR_NOTIFY_ENUM_DIR) {
+            /* If buffer overflowed after the last call,
+             * add an overflow event and retry watch.
+             */
+            add_event_to_queue (info->status, WT_EVENT_OVERFLOW, NULL, NULL);
+            goto retry;
+        }
     } else {
         if (first_alloc)
             /* insert the aux buffer into hash table at the first watch */
@@ -204,7 +306,6 @@ add_handle_to_iocp (SeafWTMonitorPriv *priv, HANDLE hAdd)
 
 }
 
-
 /* Add the pipe handle and all repo wt handles to IO Completion Port. */
 static BOOL
 add_all_to_iocp (SeafWTMonitorPriv *priv)
@@ -234,96 +335,246 @@ add_all_to_iocp (SeafWTMonitorPriv *priv)
     return TRUE;
 }
 
-
-/* Get the HANDLE of a repo directory, for latter use in
- * ReadDirectoryChangesW(). This handle should be closed when the repo is
- * unwatched.
+#if 0
+/*
+ * We only recognize two consecutive "moved" events with the same cookie as
+ * a rename pair. The processing logic is:
+ * 1. Receive a MOVED_FROM event, set last_cookie and old_path, set processing to TRUE
+ * 2. If the next event is MOVED_TO, and with the same cookie, then add an
+ *    WT_EVENT_RENAME event to the queue.
+ * 3. Otherwise, recognize them as one delete event followed by one
+ *    create event
+ *
+ * This is a two-state state machine. The states are 'not processing rename' and
+ * 'processing rename'.
  */
-static HANDLE
-get_handle_of_path(const wchar_t *path)
-{
-    HANDLE dir_handle = NULL;
-
-    dir_handle = CreateFileW
-        (path,                  /* file name */
-         FILE_LIST_DIRECTORY,   /* desired access */
-         FILE_SHARE_DELETE | FILE_SHARE_READ
-         | FILE_SHARE_WRITE,    /* share mode */
-         NULL,                  /* securitry attr */
-         OPEN_EXISTING,         /* open options */
-         FILE_FLAG_BACKUP_SEMANTICS |
-         FILE_FLAG_OVERLAPPED,  /* flags needed for asynchronous IO*/
-         NULL);                 /* template file */
-
-    if (dir_handle == INVALID_HANDLE_VALUE) {
-        char *path_utf8 = g_utf16_to_utf8 (path, -1, NULL, NULL, NULL);
-        seaf_warning("failed to create dir handle for path %s, "
-                     "error code %lu", path_utf8, GetLastError());
-        g_free (path_utf8);
-        return NULL;
-    }
-
-    return dir_handle;
-}
-
-/* Free the aux buffer when a repo is unwatched. */
 static void
-rm_from_buf_hash (SeafWTMonitorPriv *priv, HANDLE dir_handle)
+handle_rename (RepoWatchInfo *info,
+               PFILE_NOTIFY_INFORMATION event,
+               const char *worktree,
+               const char *filename,
+               gboolean last_event)
 {
-    DirWatchAux *aux = g_hash_table_lookup(priv->buf_hash,
-                                           (gconstpointer)dir_handle);
+    WTStatus *status = info->status;
+    RenameInfo *rename_info = info->rename_info;
 
-    if (!aux)
-        return;
+    if (event->Action == FILE_ACTION_RENAMED_OLD_NAME)
+        seaf_debug ("Move %s ->\n", filename);
+    else if (event->Action == FILE_ACTION_RENAMED_NEW_NAME)
+        seaf_debug ("Move -> %s.\n", filename);
 
-    g_hash_table_remove(priv->buf_hash, dir_handle);
+    if (!rename_info->processing) {
+        if (event->Action == FILE_ACTION_RENAMED_OLD_NAME) {
+            if (!last_event) {
+                set_rename_processing_state (rename_info, filename);
+            } else {
+                /* Rename event pair should be in one batch of events.
+                 * If a MOVED_FROM event is the last event in a batch,
+                 * the path should be moved out of the repo.
+                 */
+                add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+            }
+        } else if (event->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+            /* A file/dir was moved into this repo. */
+            /* Add watch and produce events. */
+            add_events_recursive (info, worktree, filename);
+        }
+    } else {
+        if (event->Action == FILE_ACTION_RENAMED_OLD_NAME) {
+            /* A file/dir was moved out of this repo.
+             * Output the last MOVED_FROM event as DELETE event
+             */
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
 
-    /* `aux' can't be freed here. Once we we close the dir_handle, its
-     *  outstanding io would cause GetQueuedCompletionStatus() to return some
-     *  information in aux->buf. If we free it here, it would cause seg fault.
-     *  So we just mark it here and scheduled it to be freed in the completion
-     *  code of GetQueuedCompletionStatus().
-     */
-    aux->unused = TRUE;
-    CloseHandle(dir_handle);
+            if (!last_event) {
+                /* Stay in processing state. */
+                g_free (rename_info->old_path);
+                rename_info->old_path = g_strdup(filename);
+            } else {
+                /* Another file/dir was moved out of this repo. */
+                add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+                unset_rename_processing_state (rename_info);
+            }
+        } else if (event->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+            if (event->cookie == rename_info->last_cookie) {
+                /* Rename pair detected. */
+                add_event_to_queue (status, WT_EVENT_RENAME,
+                                    rename_info->old_path, filename);
+            } else {
+                /* A file/dir was moved out of the repo, followed by
+                 * aother file/dir was moved into this repo.
+                 */
+                add_event_to_queue (status, WT_EVENT_DELETE,
+                                    rename_info->old_path, NULL);
+                add_watch_recursive (info, in_fd, worktree, filename, TRUE);
+            }
+            unset_rename_processing_state (rename_info);
+        } else {
+            /* A file/dir was moved out of this repo, followed by another
+             * file operations.
+             */
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+            unset_rename_processing_state (rename_info);
+        }
+    }
 }
 
-static HANDLE add_watch (const char* repo_id)
+#endif  /* 0 */
+
+static void
+handle_rename (RepoWatchInfo *info,
+               PFILE_NOTIFY_INFORMATION event,
+               const char *worktree,
+               const char *filename)
 {
-    SeafRepo *repo = NULL;
-    HANDLE dir_handle = NULL;
-    wchar_t *path = NULL;
 
-    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+}
 
-    if (!repo) {
-        seaf_warning ("[wt mon] cannot find repo %s.\n", repo_id);
-        return NULL;
+static gboolean
+handle_consecutive_duplicate_event (RepoWatchInfo *info,
+                                    PFILE_NOTIFY_INFORMATION event)
+{
+    gboolean duplicate;
+
+    /* Initially last_event is zero so it's not duplicate with any real events. */
+    duplicate = (info->last_event.action == event->Action &&
+                 info->last_event.name_len == event->FileNameLength &&
+                 memcmp (info->last_event.name, event->FileName, event->FileNameLength) == 0);
+
+    info->last_event.action = event->Action;
+    info->last_event.name_len = event->FileNameLength;
+    memcpy (info->last_event.name, event->FileName, event->FileNameLength);
+
+    return duplicate;
+}
+
+static char *
+convert_to_unix_path (const wchar_t *path, int path_len)
+{
+    char *utf8_path = g_utf16_to_utf8 (path, path_len/sizeof(wchar_t),
+                                       NULL, NULL, NULL);
+
+    char *p;
+    for (p = utf8_path; *p != 0; ++p)
+        if (*p == '\\')
+            *p = '/';
+
+    return utf8_path;
+}
+
+static void
+process_one_event (RepoWatchInfo *info,
+                   const char *worktree,
+                   PFILE_NOTIFY_INFORMATION event,
+                   gboolean last_event)
+{
+    WTStatus *status = info->status;
+    char *filename;
+    gboolean add_to_queue = TRUE;
+
+    if (handle_consecutive_duplicate_event (info, event))
+        add_to_queue = FALSE;
+
+    filename = convert_to_unix_path (event->FileName, event->FileNameLength);
+
+    switch (event->Action) {
+    case FILE_ACTION_ADDED:
+        seaf_debug ("Created %s.\n", filename);
+        break;
+    case FILE_ACTION_REMOVED:
+        seaf_debug ("Deleted %s.\n", filename);
+        break;
+    case FILE_ACTION_MODIFIED:
+        seaf_debug ("Modified %s.\n", filename);
+        break;
+    case FILE_ACTION_RENAMED_OLD_NAME:
+        seaf_debug ("Move %s ->\n", filename);
+        break;
+    case FILE_ACTION_RENAMED_NEW_NAME:
+        seaf_debug ("Move -> %s.\n", filename);
+        break;
     }
 
-    /* repo->worktree is in utf8, need to convert to wchar in win32 */
-    path = wchar_from_utf8 (repo->worktree);
+#if 0
+    handle_rename (in_fd, info, event, worktree, filename, last_event);
 
-    dir_handle = get_handle_of_path (path);
-    if (!dir_handle) {
-        seaf_warning ("failed to open handle for worktree "
-                      "of repo  %s\n", repo_id);
-    } else {
-        seaf_debug ("opened handle for worktree %s\n", path);
+    if (event->mask & IN_MODIFY) {
+        seaf_debug ("Modified %s.\n", filename);
+        if (add_to_queue)
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
+    } else if (event->mask & IN_CREATE) {
+        seaf_debug ("Created %s.\n", filename);
+
+        /* Nautilus's file copy operation doesn't trigger write events.
+         * If the user copy a large file into the repo, only a create
+         * event and a close_write event will be received. If we process
+         * the create event, we'll certainly try to index a file when it's
+         * still being copied. So we'll ignore create event for files.
+         * Since write and close_write events will always be triggered,
+         * we don't need to worry about missing this file.
+         */
+        char *fullpath = g_build_filename (worktree, filename, NULL);
+        struct stat st;
+        if (lstat (fullpath, &st) < 0 ||
+            (!S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))) {
+            g_free (fullpath);
+            update_last_changed = FALSE;
+            goto out;
+        }
+        g_free (fullpath);
+
+        /* We now know it's a directory or a symlink. */
+
+        /* Files or dirs could have been added under this dir before we
+         * watch it. So it's safer to scan this dir. At most time we don't
+         * have to scan recursively and very few new files will be found.
+         */
+        add_watch_recursive (info, in_fd, worktree, filename, TRUE);
+    } else if (event->mask & IN_DELETE) {
+        seaf_debug ("Deleted %s.\n", filename);
+        add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+    } else if (event->mask & IN_CLOSE_WRITE) {
+        seaf_debug ("Close write %s.\n", filename);
+        if (add_to_queue)
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
     }
 
-    g_free (path);
+out:
+    g_free (filename);
+    if (update_last_changed)
+        g_atomic_int_set (&info->status->last_changed, (gint)time(NULL));
+#endif
 
-    return dir_handle;
+}
+
+static gboolean
+process_events (const char *repo_id, RepoWatchInfo *info,
+                char *event_buf, unsigned int buf_size)
+{
+    PFILE_NOTIFY_INFORMATION event;
+
+    int offset = 0;
+    while (1) {
+        event = (PFILE_NOTIFY_INFORMATION)&event_buf[offset];
+        offset += event->NextEntryOffset;
+
+        process_one_event (info, info->worktree,
+                           event, (event->NextEntryOffset == 0));
+
+        if (!event->NextEntryOffset)
+            break;
+    }
+
+    return TRUE;
 }
 
 static void *
-wt_monitor_job (void *vmonitor)
+wt_monitor_job_win32 (void *vmonitor)
 {
     SeafWTMonitor *monitor = vmonitor;
     SeafWTMonitorPriv *priv = monitor->priv;
     /* 2 * sizeof(inotify_event) + 256, should be large enough for one event.*/
-    WTStatus *status;
+    RepoWatchInfo *info;
 
 
     DWORD bytesRead = 0;
@@ -388,20 +639,13 @@ wt_monitor_job (void *vmonitor)
             /* Trigger by one of the dir watch handles */
 
             HANDLE hTriggered = (HANDLE)key;
-            status = (WTStatus *)g_hash_table_lookup
-                (priv->status_hash, (gconstpointer)hTriggered); 
+            info = (RepoWatchInfo *)g_hash_table_lookup
+                (priv->info_hash, (gconstpointer)hTriggered); 
 
-            char *repo_id = NULL;
-
-            if (status && status->repo_id)
-                repo_id = status->repo_id;
-            else
-                repo_id = "Unknown-repo-id";
-
-            if (status) {
-                g_atomic_int_set (&status->last_changed, (gint)time(NULL));
-
+            if (info) {
                 seaf_debug("worktree change detected, repo %s\n", repo_id);
+
+                process_events (info->status->repo_id, info, aux->buf, bytesRead);
 
                 reset_overlapped(ol);
                 if (!start_watch_dir_change(priv, hTriggered)) {
@@ -416,34 +660,173 @@ wt_monitor_job (void *vmonitor)
                 DirWatchAux *aux = g_hash_table_lookup (priv->buf_hash, (gconstpointer)hTriggered);
                 if (aux && aux->unused)
                     g_free (aux);
+                g_hash_table_remove (priv->buf_hash, (gconstpointer)hTriggered);
             }
         }
     }
     return NULL;
 }
 
-static int handle_add_repo (SeafWTMonitorPriv *priv, const char *repo_id, long *handle)
+static int
+add_events_recursive (RepoWatchInfo *info,
+                      const char *worktree,
+                      const char *path)
 {
-    HANDLE inotify_fd;
+    char *full_path;
+    SeafStat st;
+    GDir *dir;
 
-    g_return_val_if_fail (handle != NULL, -1);
+    full_path = g_build_filename (worktree, path, NULL);
 
-    inotify_fd = add_watch (repo_id);
-    if (inotify_fd == NULL ||
-        !add_handle_to_iocp(priv, inotify_fd)) {
-        return -1;
+    if (seaf_stat (full_path, &st) < 0) {
+        seaf_warning ("[wt mon] fail to stat %s: %s\n", full_path, strerror(errno));
+        goto out;
     }
 
-    *handle = (long)inotify_fd;
+    if (path[0] != 0)
+        add_event_to_queue (info->status, WT_EVENT_CREATE_OR_UPDATE,
+                            path, NULL);
+
+    if (S_ISDIR (st.st_mode)) {
+        GError *error = NULL;
+        dir = g_dir_open (full_path, 0, &error);
+        if (!dir) {
+            seaf_warning ("[wt mon] fail to open dir %s: %s.\n",
+                          full_path, error->message);
+            goto out;
+        }
+
+        const char *dname;
+        while ((dname = g_dir_read_name (dir)) != NULL) {
+            char *sub_path = g_build_filename (path, dname, NULL);
+            add_watch_recursive (info, worktree, sub_path);
+            g_free (sub_path);
+        }
+
+        g_dir_close (dir);
+    }
+
+out:
+    g_free (full_path);
+    return 0;
+}
+
+/* Get the HANDLE of a repo directory, for latter use in
+ * ReadDirectoryChangesW(). This handle should be closed when the repo is
+ * unwatched.
+ */
+static HANDLE
+get_handle_of_path(const wchar_t *path)
+{
+    HANDLE dir_handle = NULL;
+
+    dir_handle = CreateFileW
+        (path,                  /* file name */
+         FILE_LIST_DIRECTORY,   /* desired access */
+         FILE_SHARE_DELETE | FILE_SHARE_READ
+         | FILE_SHARE_WRITE,    /* share mode */
+         NULL,                  /* securitry attr */
+         OPEN_EXISTING,         /* open options */
+         FILE_FLAG_BACKUP_SEMANTICS |
+         FILE_FLAG_OVERLAPPED,  /* flags needed for asynchronous IO*/
+         NULL);                 /* template file */
+
+    if (dir_handle == INVALID_HANDLE_VALUE) {
+        char *path_utf8 = g_utf16_to_utf8 (path, -1, NULL, NULL, NULL);
+        seaf_warning("failed to create dir handle for path %s, "
+                     "error code %lu", path_utf8, GetLastError());
+        g_free (path_utf8);
+        return NULL;
+    }
+
+    return dir_handle;
+}
+
+static HANDLE add_watch (SeafWTMonitorPriv *priv,
+                         const char *repo_id,
+                         const char *worktree)
+{
+    HANDLE dir_handle = NULL;
+    wchar_t *path = NULL;
+    RepoWatchInfo *info;
+
+    /* worktree is in utf8, need to convert to wchar in win32 */
+    path = wchar_from_utf8 (worktree);
+
+    dir_handle = get_handle_of_path (path);
+    if (!dir_handle) {
+        seaf_warning ("failed to open handle for worktree "
+                      "of repo  %s\n", repo_id);
+        g_free (path);
+        return NULL;
+    }
+    g_free (path);
+
+    pthread_mutex_lock (&priv->hash_lock);
+    g_hash_table_insert (priv->handle_hash,
+                         g_strdup(repo_id), (gpointer)(long)dir_handle);
+
+    info = create_repo_watch_info (repo_id, worktree);
+    g_hash_table_insert (priv->info_hash, (gpointer)(long)dir_handle, info);
+    pthread_mutex_unlock (&priv->hash_lock);
+
+    if (add_events_recursive (info, worktree, "") < 0) {
+        CloseHandle (dir_handle);
+        pthread_mutex_lock (&priv->hash_lock);
+        g_hash_table_remove (priv->handle_hash, repo_id);
+        g_hash_table_remove (priv->info_hash, (gpointer)(long)dir_handle);
+        pthread_mutex_unlock (&priv->hash_lock);
+        return NULL;
+    }
+
+    return dir_handle;
+}
+
+static int handle_add_repo (SeafWTMonitorPriv *priv,
+                            const char *repo_id,
+                            const char *worktree)
+{
+    HANDLE handle;
+
+    handle = add_watch (repo_id);
+    if (handle == NULL ||
+        !add_handle_to_iocp(priv, handle)) {
+        return -1;
+    }
 
     return 0;
 }
 
+/* Free the aux buffer when a repo is unwatched. */
+static void
+rm_from_buf_hash (SeafWTMonitorPriv *priv, HANDLE dir_handle)
+{
+    DirWatchAux *aux = g_hash_table_lookup(priv->buf_hash,
+                                           (gconstpointer)dir_handle);
+
+    if (!aux)
+        return;
+
+    /* `aux' can't be freed here. Once we we close the dir_handle, its
+     *  outstanding io would cause GetQueuedCompletionStatus() to return some
+     *  information in aux->buf. If we free it here, it would cause seg fault.
+     *  So we just mark it here and scheduled it to be freed in the completion
+     *  code of GetQueuedCompletionStatus().
+     */
+    aux->unused = TRUE;
+    CloseHandle(dir_handle);
+}
+
 static int handle_rm_repo (SeafWTMonitorPriv *priv, gpointer handle)
 {
-    HANDLE inotify_fd = (HANDLE)handle;
+    HANDLE h = (HANDLE)handle;
 
-    rm_from_buf_hash(priv, inotify_fd);
+    rm_from_buf_hash(priv, h);
+
+    pthread_mutex_lock (&priv->hash_lock);
+    g_hash_table_remove (priv->handle_hash, repo_id);
+    g_hash_table_remove (priv->info_hash, handle);
+    pthread_mutex_unlock (&priv->hash_lock);
 
     return 0;
 }
@@ -453,4 +836,102 @@ static int handle_refresh_repo (SeafWTMonitorPriv *priv, const char *repo_id)
     return 0;
 }
 
-#include "wt-monitor-common.h"
+static void
+reply_watch_command (SeafWTMonitor *monitor, int result)
+{
+    int n;
+
+    n = pipewriten (monitor->res_pipe[1], &result, sizeof(int));
+    if (n != sizeof(int))
+        seaf_warning ("[wt mon] fail to write command result.\n");
+}
+
+static void
+handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd)
+{
+    SeafWTMonitorPriv *priv = monitor->priv;
+
+    if (cmd->type == CMD_ADD_WATCH) {
+        if (g_hash_table_lookup_extended (priv->handle_hash, cmd->repo_id,
+                                          NULL, NULL)) {
+            reply_watch_command (monitor, 0);
+            return;
+        }
+
+        if (handle_add_repo(priv, cmd->repo_id, cmd->worktree) < 0) {
+            seaf_warning ("[wt mon] failed to watch worktree of repo %s.\n",
+                          cmd->repo_id);
+            reply_watch_command (monitor, -1);
+            return;
+        }
+
+        seaf_debug ("[wt mon] add watch for repo %s\n", cmd->repo_id);
+        reply_watch_command (monitor, 0);
+    } else if (cmd->type == CMD_DELETE_WATCH) {
+        gpointer key, value;
+        if (!g_hash_table_lookup_extended (priv->handle_hash, cmd->repo_id,
+                                           &key, &value)) {
+            reply_watch_command (monitor, 0);
+            return;
+        }
+
+        handle_rm_repo (monitor, cmd->repo_id, value);
+        reply_watch_command (monitor, 0);
+    } else if (cmd->type ==  CMD_REFRESH_WATCH) {
+        if (handle_refresh_repo (priv, cmd->repo_id) < 0) {
+            seaf_warning ("[wt mon] failed to refresh watch of repo %s.\n",
+                          cmd->repo_id);
+            reply_watch_command (monitor, -1);
+            return;
+        }
+        reply_watch_command (monitor, 0);
+    }
+}
+
+/* Public interface functions. */
+
+SeafWTMonitor *
+seaf_wt_monitor_new (SeafileSession *seaf)
+{
+    SeafWTMonitor *monitor = g_new0 (SeafWTMonitor, 1);
+    SeafWTMonitorPriv *priv = g_new0 (SeafWTMonitorPriv, 1);
+
+    pthread_mutex_init (&priv->hash_lock, NULL);
+
+    priv->handle_hash = g_hash_table_new_full
+        (g_str_hash, g_str_equal, g_free, NULL);
+
+    priv->info_hash = g_hash_table_new_full
+        (g_direct_hash, g_direct_equal, NULL, (GDestroyNotify)free_repo_watch_info);
+
+    monitor->priv = priv;
+    monitor->seaf = seaf;
+
+    monitor->job_func = wt_monitor_job_win32;
+
+    return monitor;
+}
+
+WTStatus *
+seaf_wt_monitor_get_worktree_status (SeafWTMonitor *monitor,
+                                     const char *repo_id)
+{
+    SeafWTMonitorPriv *priv = monitor->priv;
+    gpointer key, value;
+    RepoWatchInfo *info;
+
+    pthread_mutex_lock (&priv->hash_lock);
+
+    if (!g_hash_table_lookup_extended (priv->handle_hash, repo_id,
+                                       &key, &value)) {
+        pthread_mutex_unlock (&priv->hash_lock);
+        return NULL;
+    }
+
+    info = g_hash_table_lookup(priv->info_hash, value);
+    wt_status_ref (info->status);
+
+    pthread_mutex_unlock (&priv->hash_lock);
+
+    return info->status;
+}
